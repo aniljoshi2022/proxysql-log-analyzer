@@ -27,6 +27,15 @@ go build -o proxysql-log-analyzer main.go
 ./proxysql-log-analyzer --file proxysql.log --port 8080
 ```
 
+## 👨‍💻How to Access UI
+
+`http://<URL>:<PORT`
+
+`http://<URL>:<PORT/api/analysis`
+
+
+## 📝Requirements
+
 To build this project from source, you need to have Go (Golang) installed on your machine.
 
 - Mac (Homebrew): `brew install go`
@@ -41,15 +50,21 @@ To build this project from source, you need to have Go (Golang) installed on you
 
 ## 📸 Screenshots
 
+
 **Dashboard/UI**
+
 
 <img width="3024" height="1268" alt="image" src="https://github.com/user-attachments/assets/7c7a91b4-dbdd-4352-bfe8-0bb8bfe3551e" />
 
+
 **Filter/Date Range**
+
 
 <img width="3024" height="1000" alt="image" src="https://github.com/user-attachments/assets/859a50c5-722b-4d2e-a58d-b0cd8e986380" />
 
+
 **Events/Info**
+
 
 <img width="3010" height="1518" alt="image" src="https://github.com/user-attachments/assets/1cd84732-4788-4d0e-a335-8406d7697c81" />
 
