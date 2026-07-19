@@ -1304,7 +1304,7 @@ type pageData struct {
 
 func main() {
 	logPath := flag.String("file", "proxysql.log", "path to proxysql.log")
-	addr := flag.String("addr", ":8080", "HTTP listen address")
+	port := flag.String("port", "8080", "HTTP listen port")
 	flag.Parse()
 
 	var err error
@@ -1335,6 +1335,8 @@ func main() {
 		json.NewEncoder(w).Encode(analysis)
 	})
 
+	addr := ":" + strings.TrimPrefix(*port, ":")
+
 	fmt.Printf("ProxySQL Log Analyzer\n")
 	fmt.Printf("  File:    %s (%d lines)\n", analysis.File, analysis.TotalLines)
 	if analysis.Meta.Version != "" {
@@ -1344,8 +1346,8 @@ func main() {
 		analysis.LevelCounts["INFO"], analysis.LevelCounts["WARNING"], analysis.LevelCounts["ERROR"])
 	fmt.Printf("  Config:  %d LOAD/SAVE events\n", len(analysis.ConfigEvents))
 	fmt.Printf("  Nodes:   %d backend node entries\n", len(analysis.BackendNodes))
-	fmt.Printf("  Open:    http://localhost%s\n", *addr)
-	fmt.Printf("  API:     http://localhost%s/api/analysis\n", *addr)
+	fmt.Printf("  Open:    http://localhost%s\n", addr)
+	fmt.Printf("  API:     http://localhost%s/api/analysis\n", addr)
 
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
