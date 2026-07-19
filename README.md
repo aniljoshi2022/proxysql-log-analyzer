@@ -8,11 +8,11 @@ A lightweight Go-based utility that parses and analyzes ProxySQL log files and g
 
 Go to the **Releases** tab, download the binary for your OS, and run it via terminal/command prompt:
 
-**Linux:** `./proxysql-log-analyzer-<ARCH> --file <FILENAME> --port <PORT>`
+**Linux:** `./proxysql-log-analyzer-<ARCH> --file=<FILENAME> --port=<PORT>`
 
-**Windows:** `proxysql-log-analyzer_win.exe --file <FILENAME> --port <PORT>`
+**Windows:** `proxysql-log-analyzer_win.exe --file=<FILENAME> --port=<PORT>`
 
-**Mac:** `./proxysql-log-analyzer_mac_Darwin_<ARCH> --file <FILENAME> --port <PORT>`
+**Mac:** `./proxysql-log-analyzer_mac_Darwin_<ARCH> --file=<FILENAME> --port=<PORT>`
 
 ### 🛠️ Option 2: Build from Source (Requires Go installed)
 
@@ -24,7 +24,7 @@ cd proxysql-log-analyzer
 
 go build -o proxysql-log-analyzer main.go
 
-./proxysql-log-analyzer --file proxysql.log --port 8080
+./proxysql-log-analyzer --file=proxysql.log --port=8080
 ```
 
 ## 👨‍💻How to Access UI
@@ -75,9 +75,9 @@ To build this project from source, you need to have Go (Golang) installed on you
 ```bash
 ./proxysql-log-analyzer --help
 Usage of ./proxysql-log-analyzer:
-  -addr string
-    	HTTP listen address (default ":8080")
   -file string
-    	path to proxysql.log (default "proxysql.log")
+      path to proxysql.log (default "proxysql.log")
+  -port string
+      HTTP listen port (default "8080")
 
 ```
