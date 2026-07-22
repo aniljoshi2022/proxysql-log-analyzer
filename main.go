@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,6 +69,8 @@ type TimelineEvent struct {
 	Title     string `json:"title"`
 	Detail    string `json:"detail"`
 	Source    string `json:"source"`
+	Hostgroup string `json:"hostgroup,omitempty"`
+	Status    string `json:"status,omitempty"`
 	LineNum   int    `json:"line"`
 }
 
@@ -90,23 +93,26 @@ type Alert struct {
 }
 
 type Analysis struct {
-	File           string          `json:"file"`
-	FileName       string          `json:"file_name"`
-	TotalLines     int             `json:"total_lines"`
-	Meta           ProxySQLMeta    `json:"meta"`
-	Entries        []LogEntry      `json:"entries"`
-	ConfigEvents   []ConfigEvent   `json:"config_events"`
-	BackendNodes   []BackendNode   `json:"backend_nodes"`
-	Timeline       []TimelineEvent `json:"timeline"`
-	Tables         []TableBlock    `json:"tables"`
-	Errors         []Alert         `json:"errors"`
-	Warnings       []Alert         `json:"warnings"`
-	LevelCounts    map[string]int  `json:"level_counts"`
-	CategoryCounts map[string]int  `json:"category_counts"`
-	StartTime      string          `json:"start_time"`
-	EndTime        string          `json:"end_time"`
-	ParsedAt       string          `json:"parsed_at"`
-	SearchIndex    string          `json:"search_index"`
+	File               string          `json:"file"`
+	FileName           string          `json:"file_name"`
+	TotalLines         int             `json:"total_lines"`
+	Meta               ProxySQLMeta    `json:"meta"`
+	Entries            []LogEntry      `json:"entries"`
+	ConfigEvents       []ConfigEvent   `json:"config_events"`
+	BackendNodes       []BackendNode   `json:"backend_nodes"`
+	Timeline           []TimelineEvent `json:"timeline"`
+	RecentTimeline     []TimelineEvent `json:"recent_timeline"`
+	Tables             []TableBlock    `json:"tables"`
+	Errors             []Alert         `json:"errors"`
+	Warnings           []Alert         `json:"warnings"`
+	LevelCounts        map[string]int  `json:"level_counts"`
+	CategoryCounts     map[string]int  `json:"category_counts"`
+	NodeStatusCounts   map[string]int  `json:"node_status_counts"`
+	TimelineHostgroups []string        `json:"timeline_hostgroups"`
+	StartTime          string          `json:"start_time"`
+	EndTime            string          `json:"end_time"`
+	ParsedAt           string          `json:"parsed_at"`
+	SearchIndex        string          `json:"search_index"`
 }
 
 // ── Regex ────────────────────────────────────────────────────────────────────
@@ -322,11 +328,13 @@ func parseLog(path string) (*Analysis, error) {
 	var tableTitle string
 	var tableTS string
 	var searchParts []string
+	var lastTimestamp string
 
-	addTimeline := func(ts, typ, level, title, detail, source string, line int) {
+	addTimeline := func(ts, typ, level, title, detail, source, hg, status string, line int) {
 		a.Timeline = append(a.Timeline, TimelineEvent{
 			Timestamp: ts, Type: typ, Level: level,
-			Title: title, Detail: detail, Source: source, LineNum: line,
+			Title: title, Detail: detail, Source: source,
+			Hostgroup: hg, Status: status, LineNum: line,
 		})
 	}
 
@@ -394,6 +402,9 @@ func parseLog(path string) (*Analysis, error) {
 						break
 					}
 				}
+				if tableTS == "" {
+					tableTS = lastTimestamp
+				}
 			}
 			tableLines = append(tableLines, trimmed)
 			a.Entries = append(a.Entries, LogEntry{
@@ -414,13 +425,7 @@ func parseLog(path string) (*Analysis, error) {
 		}
 
 		if m := reHID.FindStringSubmatch(trimmed); m != nil {
-			ts := ""
-			for j := i - 1; j >= 0 && j >= i-2; j-- {
-				if m2 := reStandard.FindStringSubmatch(lines[j]); m2 != nil {
-					ts = m2[1]
-					break
-				}
-			}
+			ts := lastTimestamp
 			node := BackendNode{
 				Engine: "mysql", Hostgroup: m[1], Hostname: m[2], Port: m[3],
 				Weight: m[4], Status: m[5], MaxConns: m[6],
@@ -432,7 +437,7 @@ func parseLog(path string) (*Analysis, error) {
 			})
 			addTimeline(ts, "node_online", "INFO",
 				fmt.Sprintf("Node ONLINE: %s:%s (HG %s)", m[2], m[3], m[1]),
-				trimmed, "", lineNum)
+				trimmed, "", m[1], m[5], lineNum)
 			continue
 		}
 
@@ -461,6 +466,7 @@ func parseLog(path string) (*Analysis, error) {
 		a.CategoryCounts[entry.Category]++
 
 		if entry.Timestamp != "" {
+			lastTimestamp = entry.Timestamp
 			if a.StartTime == "" {
 				a.StartTime = entry.Timestamp
 			}
@@ -504,7 +510,7 @@ func parseLog(path string) (*Analysis, error) {
 			a.ConfigEvents = append(a.ConfigEvents, ce)
 			addTimeline(entry.Timestamp, "config_"+strings.ToLower(m[1]), "INFO",
 				fmt.Sprintf("%s %s", m[1], m[2]),
-				entry.Message, entry.Source, lineNum)
+				entry.Message, entry.Source, "", "", lineNum)
 		}
 		if m := reChecksum.FindStringSubmatch(entry.Message); m != nil {
 			ce := ConfigEvent{
@@ -518,7 +524,7 @@ func parseLog(path string) (*Analysis, error) {
 			a.ConfigEvents = append(a.ConfigEvents, ce)
 			addTimeline(entry.Timestamp, "config_load", "INFO",
 				"LOAD "+m[1],
-				fmt.Sprintf("checksum %s (epoch %s)", m[2], m[3]), entry.Source, lineNum)
+				fmt.Sprintf("checksum %s (epoch %s)", m[2], m[3]), entry.Source, "", "", lineNum)
 		}
 
 		// Server creation
@@ -531,7 +537,7 @@ func parseLog(path string) (*Analysis, error) {
 			a.BackendNodes = append(a.BackendNodes, node)
 			addTimeline(m[1], "node_created", "INFO",
 				fmt.Sprintf("Created node %s:%s in HG %s", m[3], m[4], m[2]),
-				entry.Message, entry.Source, lineNum)
+				entry.Message, entry.Source, m[2], node.Status, lineNum)
 		}
 
 		// Alerts
@@ -539,7 +545,7 @@ func parseLog(path string) (*Analysis, error) {
 			alert := Alert{Level: entry.Level, Timestamp: entry.Timestamp,
 				Source: entry.Source, Message: entry.Message, LineNum: lineNum}
 			a.Errors = append(a.Errors, alert)
-			addTimeline(entry.Timestamp, "error", "ERROR", entry.Message, entry.Source, entry.Source, lineNum)
+			addTimeline(entry.Timestamp, "error", "ERROR", entry.Message, entry.Source, entry.Source, "", "", lineNum)
 			if m := reShun.FindStringSubmatch(entry.Message); m != nil {
 				a.BackendNodes = append(a.BackendNodes, BackendNode{
 					Engine: "mysql", Hostname: m[1], Port: m[2], Status: "SHUNNED",
@@ -547,18 +553,18 @@ func parseLog(path string) (*Analysis, error) {
 				})
 				addTimeline(entry.Timestamp, "node_shunned", "ERROR",
 					fmt.Sprintf("Node SHUNNED: %s:%s", m[1], m[2]),
-					entry.Message, entry.Source, lineNum)
+					entry.Message, entry.Source, "", "SHUNNED", lineNum)
 			}
 		}
 		if entry.Level == "WARNING" {
 			alert := Alert{Level: entry.Level, Timestamp: entry.Timestamp,
 				Source: entry.Source, Message: entry.Message, LineNum: lineNum}
 			a.Warnings = append(a.Warnings, alert)
-			addTimeline(entry.Timestamp, "warning", "WARNING", entry.Message, entry.Source, entry.Source, lineNum)
+			addTimeline(entry.Timestamp, "warning", "WARNING", entry.Message, entry.Source, entry.Source, "", "", lineNum)
 		}
 
 		if entry.Category == "startup" && entry.Timestamp != "" {
-			addTimeline(entry.Timestamp, "startup", entry.Level, entry.Message, "", entry.Source, lineNum)
+			addTimeline(entry.Timestamp, "startup", entry.Level, entry.Message, "", entry.Source, "", "", lineNum)
 		}
 
 		// Every "Dumping ..." line is a distinct, timestamped moment where
@@ -567,7 +573,7 @@ func parseLog(path string) (*Analysis, error) {
 		// derived from it.
 		if entry.Category == "backend_nodes" && entry.Timestamp != "" &&
 			strings.HasPrefix(strings.ToLower(entry.Message), "dumping") {
-			addTimeline(entry.Timestamp, "dump", entry.Level, entry.Message, "", entry.Source, lineNum)
+			addTimeline(entry.Timestamp, "dump", entry.Level, entry.Message, "", entry.Source, "", "", lineNum)
 		}
 	}
 
@@ -580,6 +586,44 @@ func parseLog(path string) (*Analysis, error) {
 			return a.Timeline[i].Timestamp < a.Timeline[j].Timestamp
 		}
 		return a.Timeline[i].LineNum < a.Timeline[j].LineNum
+	})
+
+	// Overview shows the most recent activity, newest first — take the
+	// tail of the (oldest-first sorted) timeline and reverse it.
+	const recentN = 20
+	start := len(a.Timeline) - recentN
+	if start < 0 {
+		start = 0
+	}
+	for i := len(a.Timeline) - 1; i >= start; i-- {
+		a.RecentTimeline = append(a.RecentTimeline, a.Timeline[i])
+	}
+
+	a.NodeStatusCounts = map[string]int{}
+	for _, n := range a.BackendNodes {
+		st := n.Status
+		if st == "" {
+			st = "UNKNOWN"
+		}
+		a.NodeStatusCounts[st]++
+	}
+
+	hgSet := map[string]bool{}
+	for _, e := range a.Timeline {
+		if e.Hostgroup != "" {
+			hgSet[e.Hostgroup] = true
+		}
+	}
+	for hg := range hgSet {
+		a.TimelineHostgroups = append(a.TimelineHostgroups, hg)
+	}
+	sort.Slice(a.TimelineHostgroups, func(i, j int) bool {
+		vi, ei := strconv.Atoi(a.TimelineHostgroups[i])
+		vj, ej := strconv.Atoi(a.TimelineHostgroups[j])
+		if ei == nil && ej == nil {
+			return vi < vj
+		}
+		return a.TimelineHostgroups[i] < a.TimelineHostgroups[j]
 	})
 
 	sort.Slice(a.ConfigEvents, func(i, j int) bool {
@@ -603,8 +647,6 @@ const pageHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProxySQL Log Analyzer{{if .Meta.Version}} — v{{.Meta.Version}}{{end}}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg: #0b0f14;
@@ -622,8 +664,8 @@ const pageHTML = `<!DOCTYPE html>
   --config: #a78bfa;
   --node: #06b6d4;
   --radius: 10px;
-  --font: 'Inter', system-ui, sans-serif;
-  --mono: 'JetBrains Mono', 'SF Mono', monospace;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.55; }
@@ -834,8 +876,34 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); min-
 }
 .node-status.ONLINE, .node-status.online, .node-status.configured { background: rgba(34,197,94,0.15); color: var(--ok); }
 .node-status.SHUNNED, .node-status.shunned { background: rgba(255,77,79,0.15); color: var(--error); }
+.node-status.OFFLINE_SOFT, .node-status.offline_soft { background: rgba(224,169,64,0.15); color: var(--warn, #e0a940); }
+.node-status.OFFLINE_HARD, .node-status.offline_hard { background: rgba(226,86,77,0.18); color: var(--error); }
 .node-status.created { background: rgba(59,158,255,0.15); color: var(--info); }
 .engine-tag { font-size: 0.68rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: var(--surface3); color: var(--muted); }
+
+.status-filter-row {
+  display: flex; flex-wrap: wrap; gap: 0.5rem;
+  padding: 0.75rem 1rem; border-bottom: 1px solid var(--border);
+}
+.status-chip {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  background: var(--surface2); border: 1px solid var(--border); color: var(--muted);
+  padding: 0.35rem 0.75rem; border-radius: 100px; font-size: 0.76rem; font-family: var(--mono);
+  cursor: pointer; transition: all 0.15s;
+}
+.status-chip:hover { color: var(--text); border-color: var(--muted); }
+.status-chip .cnt {
+  background: var(--surface3); color: var(--text); font-weight: 700;
+  padding: 0.05rem 0.4rem; border-radius: 100px; font-size: 0.72rem;
+}
+.status-chip.active { color: var(--bg); border-color: transparent; }
+.status-chip.active .cnt { background: rgba(0,0,0,0.2); color: inherit; }
+.status-chip[data-status=""].active { background: var(--accent); }
+.status-chip[data-status="ONLINE"].active { background: var(--ok); }
+.status-chip[data-status="SHUNNED"].active { background: var(--error); }
+.status-chip[data-status="OFFLINE_SOFT"].active { background: #e0a940; }
+.status-chip[data-status="OFFLINE_HARD"].active { background: var(--error); }
+.status-chip[data-status="UNKNOWN"].active { background: var(--muted); }
 
 table.data { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
 table.data th {
@@ -941,14 +1009,14 @@ table.data tr.hidden { display: none; }
     <div class="stat warn"><div class="label">Warnings</div><div class="value">{{index .LevelCounts "WARNING"}}</div></div>
     <div class="stat error"><div class="label">Errors</div><div class="value">{{index .LevelCounts "ERROR"}}</div></div>
     <div class="stat config"><div class="label">Config Events</div><div class="value">{{len .ConfigEvents}}</div></div>
-    <div class="stat node"><div class="label">Backend Nodes</div><div class="value">{{len .BackendNodes}}</div></div>
+    <div class="stat node"><div class="label">Backend Node Events</div><div class="value">{{len .BackendNodes}}</div></div>
   </div>
 
   <div class="tabs">
     <button class="tab active" data-tab="overview">Overview</button>
     <button class="tab" data-tab="timeline">Event Timeline<span class="cnt">{{len .Timeline}}</span></button>
     <button class="tab" data-tab="config">Config Changes<span class="cnt">{{len .ConfigEvents}}</span></button>
-    <button class="tab" data-tab="nodes">Backend Nodes<span class="cnt">{{len .BackendNodes}}</span></button>
+    <button class="tab" data-tab="nodes">Backend Node Events<span class="cnt">{{len .BackendNodes}}</span></button>
     <button class="tab" data-tab="errors">Errors<span class="cnt">{{len .Errors}}</span></button>
     <button class="tab" data-tab="warnings">Warnings<span class="cnt">{{len .Warnings}}</span></button>
     <button class="tab" data-tab="dumps">Node Dumps<span class="cnt">{{len .Tables}}</span></button>
@@ -964,25 +1032,25 @@ table.data tr.hidden { display: none; }
         <div class="meta-item"><div class="k">Log File</div><div class="v">{{.File}}</div></div>
         <div class="meta-item"><div class="k">Analysis Mode</div><div class="v">Static file (provided at startup via -file flag)</div></div>
         <div class="meta-item"><div class="k">Config LOAD/SAVE Operations</div><div class="v">{{len .ConfigEvents}} events detected</div></div>
-        <div class="meta-item"><div class="k">Backend Nodes Tracked</div><div class="v">{{len .BackendNodes}} entries from dumps &amp; runtime</div></div>
+        <div class="meta-item"><div class="k">Backend Node Events Tracked</div><div class="v">{{len .BackendNodes}} status entries across dumps &amp; runtime (not distinct node count)</div></div>
         <div class="meta-item"><div class="k">Issues Found</div><div class="v">{{len .Errors}} errors, {{len .Warnings}} warnings</div></div>
       </div>
     </div>
-    {{if .Timeline}}
+    {{if .RecentTimeline}}
     <div class="card">
-      <div class="card-header">Recent Events</div>
+      <div class="card-header">Recent Events<span class="tag" style="background:rgba(124,108,255,0.15);color:var(--accent)">last {{len .RecentTimeline}}, newest first</span></div>
       <div class="timeline" id="overview-timeline">
-      {{range $i, $e := .Timeline}}{{if lt $i 8}}
-        <div class="tl-item" data-search="{{lower $e.Timestamp}} {{lower $e.Type}} {{lower $e.Title}} {{lower $e.Detail}} {{lower $e.Source}}" data-ts="{{$e.Timestamp}}">
-          <div class="tl-time">{{$e.Timestamp}}</div>
-          <div class="tl-dot {{$e.Type}}"></div>
+      {{range .RecentTimeline}}
+        <div class="tl-item" data-search="{{lower .Timestamp}} {{lower .Type}} {{lower .Title}} {{lower .Detail}} {{lower .Source}}" data-ts="{{.Timestamp}}">
+          <div class="tl-time">{{.Timestamp}}</div>
+          <div class="tl-dot {{.Type}}"></div>
           <div>
-            <div class="tl-title">{{$e.Title}}</div>
-            {{if $e.Detail}}<div class="tl-detail">{{$e.Detail}}</div>{{end}}
-            <div class="tl-line">Line {{$e.LineNum}}</div>
+            <div class="tl-title">{{.Title}}</div>
+            {{if .Detail}}<div class="tl-detail">{{.Detail}}</div>{{end}}
+            <div class="tl-line">Line {{.LineNum}}</div>
           </div>
         </div>
-      {{end}}{{end}}
+      {{end}}
       </div>
     </div>
     {{end}}
@@ -992,22 +1060,37 @@ table.data tr.hidden { display: none; }
   <div id="timeline" class="panel">
     <div class="card">
       <div class="card-header">Chronological Event Timeline<span class="tag" style="background:rgba(124,108,255,0.15);color:var(--accent)">{{len .Timeline}} events</span></div>
+      <div class="status-filter-row" id="timeline-filter-row">
+        <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.76rem;color:var(--muted);font-family:var(--mono)">
+          HG/HID
+          <select id="timeline-hg-filter" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:0.3rem 0.5rem;border-radius:6px;font-family:var(--mono);font-size:0.76rem">
+            <option value="">All</option>
+            {{range .TimelineHostgroups}}<option value="{{.}}">HG {{.}}</option>{{end}}
+          </select>
+        </label>
+        <button class="status-chip active" data-tl-status="">All statuses</button>
+        <button class="status-chip" data-tl-status="ONLINE">status: ONLINE</button>
+        <button class="status-chip" data-tl-status="SHUNNED">status: SHUNNED</button>
+        <button class="status-chip" data-tl-status="OFFLINE_SOFT">status: OFFLINE_SOFT</button>
+        <button class="status-chip" data-tl-status="OFFLINE_HARD">status: OFFLINE_HARD</button>
+      </div>
       <div class="timeline" id="event-timeline">
       {{range .Timeline}}
-        <div class="tl-item" data-search="{{lower .Timestamp}} {{lower .Type}} {{lower .Title}} {{lower .Detail}} {{lower .Source}} {{lower .Level}}" data-ts="{{.Timestamp}}">
+        <div class="tl-item" data-search="{{lower .Timestamp}} {{lower .Type}} {{lower .Title}} {{lower .Detail}} {{lower .Source}} {{lower .Level}}" data-ts="{{.Timestamp}}" data-tl-hg="{{.Hostgroup}}" data-tl-status="{{.Status}}">
           <div class="tl-time">{{.Timestamp}}</div>
           <div class="tl-dot {{.Type}}"></div>
           <div>
             <div class="tl-title">{{.Title}}</div>
             {{if .Detail}}<div class="tl-detail">{{.Detail}}</div>{{end}}
             {{if .Source}}<div class="tl-src">{{.Source}}</div>{{end}}
-            <div class="tl-line">Line {{.LineNum}} &middot; {{.Type}}</div>
+            <div class="tl-line">Line {{.LineNum}} &middot; {{.Type}}{{if .Hostgroup}} &middot; HG {{.Hostgroup}}{{end}}{{if .Status}} &middot; {{.Status}}{{end}}</div>
           </div>
         </div>
       {{else}}
         <div class="empty">No timeline events parsed.</div>
       {{end}}
       </div>
+      <div class="empty" id="timeline-empty-filtered" style="display:none">No events match the current HG/status filter.</div>
     </div>
   </div>
 
@@ -1031,7 +1114,15 @@ table.data tr.hidden { display: none; }
   <!-- Backend Nodes -->
   <div id="nodes" class="panel">
     <div class="card">
-      <div class="card-header">Backend Nodes &amp; Data Node Status<span class="tag" style="background:rgba(6,182,212,0.15);color:var(--node)">From dumps &amp; runtime</span></div>
+      <div class="card-header">Backend Node Events &amp; Status Over Time<span class="tag" style="background:rgba(6,182,212,0.15);color:var(--node)">Every status sighting from dumps &amp; runtime — same node may repeat</span></div>
+      <div class="status-filter-row" id="status-filter-row">
+        <button class="status-chip active" data-status="">All <span class="cnt">{{len .BackendNodes}}</span></button>
+        <button class="status-chip" data-status="ONLINE">status: ONLINE <span class="cnt">{{index .NodeStatusCounts "ONLINE"}}</span></button>
+        <button class="status-chip" data-status="SHUNNED">status: SHUNNED <span class="cnt">{{index .NodeStatusCounts "SHUNNED"}}</span></button>
+        <button class="status-chip" data-status="OFFLINE_SOFT">status: OFFLINE_SOFT <span class="cnt">{{index .NodeStatusCounts "OFFLINE_SOFT"}}</span></button>
+        <button class="status-chip" data-status="OFFLINE_HARD">status: OFFLINE_HARD <span class="cnt">{{index .NodeStatusCounts "OFFLINE_HARD"}}</span></button>
+        {{if index .NodeStatusCounts "UNKNOWN"}}<button class="status-chip" data-status="UNKNOWN">status: UNKNOWN <span class="cnt">{{index .NodeStatusCounts "UNKNOWN"}}</span></button>{{end}}
+      </div>
       <div style="overflow-x:auto">
         <table class="data" id="nodes-table">
           <thead><tr>
@@ -1040,7 +1131,7 @@ table.data tr.hidden { display: none; }
           </tr></thead>
           <tbody>
           {{range .BackendNodes}}
-          <tr data-search="{{lower .Timestamp}} {{lower .Engine}} {{lower .Hostgroup}} {{lower .Hostname}} {{lower .Port}} {{lower .Status}} {{lower .Source}}" data-ts="{{.Timestamp}}">
+          <tr data-search="{{lower .Timestamp}} {{lower .Engine}} {{lower .Hostgroup}} {{lower .Hostname}} {{lower .Port}} {{lower .Status}} {{lower .Source}}" data-ts="{{.Timestamp}}" data-status="{{.Status}}">
             <td>{{.Timestamp}}</td>
             <td><span class="engine-tag">{{.Engine}}</span></td>
             <td>{{.Hostgroup}}</td>
@@ -1178,6 +1269,9 @@ const catFilter = document.getElementById('cat-filter');
 const dateFrom = document.getElementById('date-from');
 const dateTo = document.getElementById('date-to');
 const clearFiltersBtn = document.getElementById('clear-filters');
+let nodeStatusFilter = '';
+let timelineHGFilter = '';
+let timelineStatusFilter = '';
 
 function searchableItems() {
   return document.querySelectorAll('[data-search]');
@@ -1204,22 +1298,24 @@ function tsInRange(ts) {
 }
 
 function hasActiveFilters() {
-  return !!(globalSearch.value.trim() || dateFrom.value || dateTo.value ||
+  return !!(globalSearch.value.trim() || dateFrom.value || dateTo.value || nodeStatusFilter ||
+    timelineHGFilter || timelineStatusFilter ||
     (levelFilter && levelFilter.value) || (catFilter && catFilter.value));
 }
 
 function applyGlobalSearch() {
   const q = (globalSearch.value || '').trim().toLowerCase();
-  let visible = 0;
   const rangeActive = !!(dateFrom.value || dateTo.value);
 
   searchableItems().forEach(el => {
     const text = el.dataset.search || '';
     const matchQ = !q || text.includes(q);
     const matchDate = tsInRange(el.dataset.ts);
-    const match = matchQ && matchDate;
+    // data-status is only present on backend-node rows; elements without
+    // it (every other tab) are unaffected by the node status filter.
+    const matchStatus = !nodeStatusFilter || el.dataset.status === undefined || el.dataset.status === nodeStatusFilter;
+    const match = matchQ && matchDate && matchStatus;
     el.classList.toggle('hidden', !match);
-    if (match) visible++;
   });
 
   // Also filter log rows with level/cat when on logs panel
@@ -1233,7 +1329,27 @@ function applyGlobalSearch() {
     const show = matchQ && matchL && matchC && matchDate;
     row.classList.toggle('hidden', !show);
   });
-  visible += document.querySelectorAll('#log-list .log-row:not(.hidden)').length;
+
+  // Event Timeline tab: filter by hostgroup/HID and status on top of the
+  // search+date match already applied above (most events have no HG/status,
+  // so the filter simply doesn't apply to them).
+  let timelineVisible = 0, timelineTotal = 0;
+  document.querySelectorAll('#event-timeline .tl-item').forEach(item => {
+    timelineTotal++;
+    const matchQ = !q || (item.dataset.search || '').includes(q);
+    const matchDate = tsInRange(item.dataset.ts);
+    const matchHG = !timelineHGFilter || item.dataset.tlHg === timelineHGFilter;
+    const matchStatus = !timelineStatusFilter || item.dataset.tlStatus === timelineStatusFilter;
+    const show = matchQ && matchDate && matchHG && matchStatus;
+    item.classList.toggle('hidden', !show);
+    if (show) timelineVisible++;
+  });
+  const timelineEmptyMsg = document.getElementById('timeline-empty-filtered');
+  if (timelineEmptyMsg) {
+    timelineEmptyMsg.style.display = (timelineTotal > 0 && timelineVisible === 0) ? 'block' : 'none';
+  }
+
+  const visible = document.querySelectorAll('[data-search]:not(.hidden)').length;
 
   if (q || rangeActive) {
     searchCount.textContent = visible + ' match' + (visible !== 1 ? 'es' : '');
@@ -1269,7 +1385,37 @@ function clearAllFilters() {
   dateTo.value = '';
   if (levelFilter) levelFilter.value = '';
   if (catFilter) catFilter.value = '';
+  nodeStatusFilter = '';
+  timelineHGFilter = '';
+  timelineStatusFilter = '';
+  document.querySelectorAll('#status-filter-row .status-chip').forEach(c => c.classList.toggle('active', c.dataset.status === ''));
+  document.querySelectorAll('#timeline-filter-row .status-chip').forEach(c => c.classList.toggle('active', c.dataset.tlStatus === ''));
+  const hgSelect = document.getElementById('timeline-hg-filter');
+  if (hgSelect) hgSelect.value = '';
   applyGlobalSearch();
+}
+
+document.querySelectorAll('#status-filter-row .status-chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    nodeStatusFilter = chip.dataset.status;
+    document.querySelectorAll('#status-filter-row .status-chip').forEach(c => c.classList.toggle('active', c === chip));
+    applyGlobalSearch();
+  });
+});
+
+document.querySelectorAll('#timeline-filter-row .status-chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    timelineStatusFilter = chip.dataset.tlStatus;
+    document.querySelectorAll('#timeline-filter-row .status-chip').forEach(c => c.classList.toggle('active', c === chip));
+    applyGlobalSearch();
+  });
+});
+const timelineHGSelect = document.getElementById('timeline-hg-filter');
+if (timelineHGSelect) {
+  timelineHGSelect.addEventListener('change', () => {
+    timelineHGFilter = timelineHGSelect.value;
+    applyGlobalSearch();
+  });
 }
 
 globalSearch.addEventListener('input', applyGlobalSearch);
