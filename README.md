@@ -56,23 +56,24 @@ To build this project from source, you need to have Go (Golang) installed on you
 
 
 **Dashboard/UI**
-
-
 <img width="3024" height="1268" alt="image" src="https://github.com/user-attachments/assets/7c7a91b4-dbdd-4352-bfe8-0bb8bfe3551e" />
 
+---
 
 **Date/Time filter to get matching searches**
-
-
 <img width="3024" height="1000" alt="image" src="https://github.com/user-attachments/assets/859a50c5-722b-4d2e-a58d-b0cd8e986380" />
 
+---
 
 **Node and Host group level filters** 
 <img width="2928" height="844" alt="image" src="https://github.com/user-attachments/assets/ce21658f-6ff3-447b-a59d-9a33319d83ba" />
 
+---
+
 **More granular filters for the full logs**
 <img width="3024" height="850" alt="image" src="https://github.com/user-attachments/assets/f4a001ff-1534-4278-bc40-e6173dcbc42e" />
 
+---
 
 ## **🔖Usage**
 
