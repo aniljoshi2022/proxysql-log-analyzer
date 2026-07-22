@@ -43,7 +43,11 @@ To build this project from source, you need to have Go (Golang) installed on you
 - Linux (Centos/Rhel): `sudo yum/dnf install go`
 - Windows: Download the installer from `https://go.dev/dl/`
 
-
+## ✨ Features
+- Parses ProxySQL logs efficiently
+- Time range and other status filters for more granularity in search
+- Details related to events, backend nodes, errors, warnings, etc
+  
 ---
 
 
@@ -52,23 +56,24 @@ To build this project from source, you need to have Go (Golang) installed on you
 
 
 **Dashboard/UI**
-
-
 <img width="3024" height="1268" alt="image" src="https://github.com/user-attachments/assets/7c7a91b4-dbdd-4352-bfe8-0bb8bfe3551e" />
 
+---
 
-**Filter/Date Range**
-
-
+**Date/Time filter to get matching searches**
 <img width="3024" height="1000" alt="image" src="https://github.com/user-attachments/assets/859a50c5-722b-4d2e-a58d-b0cd8e986380" />
 
+---
 
-**Events/Info**
+**Node and Host group level filters** 
+<img width="2928" height="844" alt="image" src="https://github.com/user-attachments/assets/ce21658f-6ff3-447b-a59d-9a33319d83ba" />
 
+---
 
-<img width="3010" height="1518" alt="image" src="https://github.com/user-attachments/assets/1cd84732-4788-4d0e-a335-8406d7697c81" />
+**More granular filters for the full logs**
+<img width="3024" height="850" alt="image" src="https://github.com/user-attachments/assets/f4a001ff-1534-4278-bc40-e6173dcbc42e" />
 
-
+---
 
 ## **🔖Usage**
 
