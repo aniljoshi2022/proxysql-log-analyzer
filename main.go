@@ -109,6 +109,7 @@ type Analysis struct {
 	CategoryCounts     map[string]int  `json:"category_counts"`
 	NodeStatusCounts   map[string]int  `json:"node_status_counts"`
 	TimelineHostgroups []string        `json:"timeline_hostgroups"`
+	NodeHostgroups     []string        `json:"node_hostgroups"`
 	StartTime          string          `json:"start_time"`
 	EndTime            string          `json:"end_time"`
 	ParsedAt           string          `json:"parsed_at"`
@@ -426,18 +427,37 @@ func parseLog(path string) (*Analysis, error) {
 
 		if m := reHID.FindStringSubmatch(trimmed); m != nil {
 			ts := lastTimestamp
+			status := strings.ToUpper(m[5])
 			node := BackendNode{
 				Engine: "mysql", Hostgroup: m[1], Hostname: m[2], Port: m[3],
-				Weight: m[4], Status: m[5], MaxConns: m[6],
+				Weight: m[4], Status: status, MaxConns: m[6],
 				Source: "runtime HID dump", Timestamp: ts, LineNum: lineNum,
 			}
 			a.BackendNodes = append(a.BackendNodes, node)
 			a.Entries = append(a.Entries, LogEntry{
 				LineNum: lineNum, Kind: "server", Message: trimmed, Category: "backend_nodes",
 			})
-			addTimeline(ts, "node_online", "INFO",
-				fmt.Sprintf("Node ONLINE: %s:%s (HG %s)", m[2], m[3], m[1]),
-				trimmed, "", m[1], m[5], lineNum)
+
+			// The HID line's status can be ONLINE, SHUNNED, OFFLINE_SOFT,
+			// OFFLINE_HARD, or anything else ProxySQL reports — the
+			// timeline entry (type, title, dot color) must reflect the
+			// actual status, not always "ONLINE".
+			var tlType string
+			switch status {
+			case "ONLINE":
+				tlType = "node_online"
+			case "SHUNNED":
+				tlType = "node_shunned"
+			case "OFFLINE_SOFT":
+				tlType = "node_offline_soft"
+			case "OFFLINE_HARD":
+				tlType = "node_offline_hard"
+			default:
+				tlType = "node_status"
+			}
+			addTimeline(ts, tlType, "INFO",
+				fmt.Sprintf("Node %s: %s:%s (HG %s)", status, m[2], m[3], m[1]),
+				trimmed, "", m[1], status, lineNum)
 			continue
 		}
 
@@ -624,6 +644,24 @@ func parseLog(path string) (*Analysis, error) {
 			return vi < vj
 		}
 		return a.TimelineHostgroups[i] < a.TimelineHostgroups[j]
+	})
+
+	nodeHgSet := map[string]bool{}
+	for _, n := range a.BackendNodes {
+		if n.Hostgroup != "" {
+			nodeHgSet[n.Hostgroup] = true
+		}
+	}
+	for hg := range nodeHgSet {
+		a.NodeHostgroups = append(a.NodeHostgroups, hg)
+	}
+	sort.Slice(a.NodeHostgroups, func(i, j int) bool {
+		vi, ei := strconv.Atoi(a.NodeHostgroups[i])
+		vj, ej := strconv.Atoi(a.NodeHostgroups[j])
+		if ei == nil && ej == nil {
+			return vi < vj
+		}
+		return a.NodeHostgroups[i] < a.NodeHostgroups[j]
 	})
 
 	sort.Slice(a.ConfigEvents, func(i, j int) bool {
@@ -827,11 +865,12 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); min-
   border: 2px solid var(--border); background: var(--surface3);
 }
 .tl-dot.config_load, .tl-dot.config_save { background: var(--config); border-color: var(--config); }
-.tl-dot.error, .tl-dot.node_shunned { background: var(--error); border-color: var(--error); }
+.tl-dot.error, .tl-dot.node_shunned, .tl-dot.node_offline_soft, .tl-dot.node_offline_hard { background: var(--error); border-color: var(--error); }
 .tl-dot.warning { background: var(--warn); border-color: var(--warn); }
 .tl-dot.node_created, .tl-dot.node_online { background: var(--ok); border-color: var(--ok); }
 .tl-dot.startup { background: var(--info); border-color: var(--info); }
 .tl-dot.dump { background: var(--node); border-color: var(--node); }
+.tl-dot.node_status { background: var(--muted); border-color: var(--muted); }
 .tl-title { font-weight: 500; margin-bottom: 0.15rem; }
 .tl-detail { color: var(--muted); font-size: 0.78rem; font-family: var(--mono); word-break: break-word; }
 .tl-src { color: var(--accent); font-size: 0.72rem; margin-top: 0.2rem; }
@@ -853,6 +892,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); min-
 .alert-card { padding: 1rem; border-bottom: 1px solid var(--border); }
 .alert-card:last-child { border-bottom: none; }
 .alert-card.hidden { display: none; }
+.card.hidden, .dump-card.hidden { display: none; }
 .alert-card.error-alert {
   background: rgba(255,77,79,0.06); border-left: 4px solid var(--error);
 }
@@ -1116,6 +1156,13 @@ table.data tr.hidden { display: none; }
     <div class="card">
       <div class="card-header">Backend Node Events &amp; Status Over Time<span class="tag" style="background:rgba(6,182,212,0.15);color:var(--node)">Every status sighting from dumps &amp; runtime — same node may repeat</span></div>
       <div class="status-filter-row" id="status-filter-row">
+        <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.76rem;color:var(--muted);font-family:var(--mono)">
+          HG/HID
+          <select id="node-hg-filter" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:0.3rem 0.5rem;border-radius:6px;font-family:var(--mono);font-size:0.76rem">
+            <option value="">All</option>
+            {{range .NodeHostgroups}}<option value="{{.}}">HG {{.}}</option>{{end}}
+          </select>
+        </label>
         <button class="status-chip active" data-status="">All <span class="cnt">{{len .BackendNodes}}</span></button>
         <button class="status-chip" data-status="ONLINE">status: ONLINE <span class="cnt">{{index .NodeStatusCounts "ONLINE"}}</span></button>
         <button class="status-chip" data-status="SHUNNED">status: SHUNNED <span class="cnt">{{index .NodeStatusCounts "SHUNNED"}}</span></button>
@@ -1131,7 +1178,7 @@ table.data tr.hidden { display: none; }
           </tr></thead>
           <tbody>
           {{range .BackendNodes}}
-          <tr data-search="{{lower .Timestamp}} {{lower .Engine}} {{lower .Hostgroup}} {{lower .Hostname}} {{lower .Port}} {{lower .Status}} {{lower .Source}}" data-ts="{{.Timestamp}}" data-status="{{.Status}}">
+          <tr data-search="{{lower .Timestamp}} {{lower .Engine}} {{lower .Hostgroup}} {{lower .Hostname}} {{lower .Port}} {{lower .Status}} {{lower .Source}}" data-ts="{{.Timestamp}}" data-status="{{.Status}}" data-hg="{{.Hostgroup}}">
             <td>{{.Timestamp}}</td>
             <td><span class="engine-tag">{{.Engine}}</span></td>
             <td>{{.Hostgroup}}</td>
@@ -1270,6 +1317,7 @@ const dateFrom = document.getElementById('date-from');
 const dateTo = document.getElementById('date-to');
 const clearFiltersBtn = document.getElementById('clear-filters');
 let nodeStatusFilter = '';
+let nodeHGFilter = '';
 let timelineHGFilter = '';
 let timelineStatusFilter = '';
 
@@ -1311,10 +1359,11 @@ function applyGlobalSearch() {
     const text = el.dataset.search || '';
     const matchQ = !q || text.includes(q);
     const matchDate = tsInRange(el.dataset.ts);
-    // data-status is only present on backend-node rows; elements without
-    // it (every other tab) are unaffected by the node status filter.
+    // data-status/data-hg are only present on backend-node rows; elements
+    // without them (every other tab) are unaffected by these filters.
     const matchStatus = !nodeStatusFilter || el.dataset.status === undefined || el.dataset.status === nodeStatusFilter;
-    const match = matchQ && matchDate && matchStatus;
+    const matchHG = !nodeHGFilter || el.dataset.hg === undefined || el.dataset.hg === nodeHGFilter;
+    const match = matchQ && matchDate && matchStatus && matchHG;
     el.classList.toggle('hidden', !match);
   });
 
@@ -1386,12 +1435,15 @@ function clearAllFilters() {
   if (levelFilter) levelFilter.value = '';
   if (catFilter) catFilter.value = '';
   nodeStatusFilter = '';
+  nodeHGFilter = '';
   timelineHGFilter = '';
   timelineStatusFilter = '';
   document.querySelectorAll('#status-filter-row .status-chip').forEach(c => c.classList.toggle('active', c.dataset.status === ''));
   document.querySelectorAll('#timeline-filter-row .status-chip').forEach(c => c.classList.toggle('active', c.dataset.tlStatus === ''));
   const hgSelect = document.getElementById('timeline-hg-filter');
   if (hgSelect) hgSelect.value = '';
+  const nodeHgSelect = document.getElementById('node-hg-filter');
+  if (nodeHgSelect) nodeHgSelect.value = '';
   applyGlobalSearch();
 }
 
@@ -1414,6 +1466,13 @@ const timelineHGSelect = document.getElementById('timeline-hg-filter');
 if (timelineHGSelect) {
   timelineHGSelect.addEventListener('change', () => {
     timelineHGFilter = timelineHGSelect.value;
+    applyGlobalSearch();
+  });
+}
+const nodeHGSelect = document.getElementById('node-hg-filter');
+if (nodeHGSelect) {
+  nodeHGSelect.addEventListener('change', () => {
+    nodeHGFilter = nodeHGSelect.value;
     applyGlobalSearch();
   });
 }
