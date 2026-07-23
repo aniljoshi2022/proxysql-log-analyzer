@@ -1,6 +1,6 @@
 # v1.0.0 — First Stable Release 🎉
 
-A lightweight Go utility that parses and analyzes ProxySQL logs, generating beautiful interactive HTML reports.
+A lightweight Go utility that parses and analyzes ProxySQL logs, generating interactive HTML report.
 
 ## ✨ What's New
 
@@ -9,7 +9,6 @@ A lightweight Go utility that parses and analyzes ProxySQL logs, generating beau
 - **Configuration Audit** — Track all LOAD/SAVE operations with checksums
 - **Backend Node Tracking** — Monitor node status changes (ONLINE, SHUNNED, OFFLINE_SOFT, OFFLINE_HARD)
 - **Dark UI** — 8 analysis tabs with interactive filters and responsive design
-- **JSON API** — `/api/analysis` endpoint for programmatic access
 
 ## 🚀 Quick Start
 
@@ -27,6 +26,5 @@ Pre-compiled binaries available for Linux, Windows, and macOS.
 - Node dump visualization  
 - Interactive global search
 - Full log categorization
-- Mobile-friendly interface
 
 **Built with:** Go 1.25.1 | **License:** MIT
