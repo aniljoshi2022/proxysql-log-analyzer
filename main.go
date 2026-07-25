@@ -1035,8 +1035,8 @@ table.data tr.hidden { display: none; }
     <span class="search-count" id="search-count"></span>
   </div>
   <div class="daterange-wrap">
-    <label>From <input type="datetime-local" id="date-from" step="1"></label>
-    <label>To <input type="datetime-local" id="date-to" step="1"></label>
+    <label>From <input type="datetime-local" id="date-from" step="1" value="{{dtlocal .StartTime}}"></label>
+    <label>To <input type="datetime-local" id="date-to" step="1" value="{{dtlocal .EndTime}}"></label>
     <span class="daterange-hint">{{if .StartTime}}log spans {{.StartTime}} &rarr; {{.EndTime}}{{end}}</span>
     <button id="clear-filters" type="button">Clear filters</button>
   </div>
@@ -1332,7 +1332,7 @@ function normalizeTs(ts) {
   if (!ts) return '';
   let s = ts.replace(' ', 'T');
   if (s.length === 16) s += ':00'; // no seconds supplied
-  return s;
+  return s.slice(0, 19); // strip fractional seconds some browsers append
 }
 
 function tsInRange(ts) {
@@ -1430,8 +1430,8 @@ function clearHighlights() {
 
 function clearAllFilters() {
   globalSearch.value = '';
-  dateFrom.value = '';
-  dateTo.value = '';
+  dateFrom.value = dateFrom.defaultValue;
+  dateTo.value = dateTo.defaultValue;
   if (levelFilter) levelFilter.value = '';
   if (catFilter) catFilter.value = '';
   nodeStatusFilter = '';
@@ -1521,6 +1521,9 @@ func main() {
 	funcMap := template.FuncMap{
 		"add":   func(a, b int) int { return a + b },
 		"lower": func(s string) string { return strings.ToLower(s) },
+		// datetime-local inputs need "YYYY-MM-DDTHH:MM:SS", but log
+		// timestamps are "YYYY-MM-DD HH:MM:SS" — just swap the separator.
+		"dtlocal": func(s string) string { return strings.Replace(s, " ", "T", 1) },
 	}
 
 	tmpl, err := template.New("page").Funcs(funcMap).Parse(pageHTML)
