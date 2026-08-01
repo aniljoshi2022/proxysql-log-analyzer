@@ -119,8 +119,8 @@ type Analysis struct {
 // ── Regex ────────────────────────────────────────────────────────────────────
 
 var (
-	reStandard = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.*)$`)
-	reSource   = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ([^\s]+): \[(\w+)\] (.*)$`)
+	reStandard = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\](?: (.*))?$`)
+	reSource   = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ([^\s]+): \[(\w+)\](?: (.*))?$`)
 	reBanner   = regexp.MustCompile(`^(Standard|In memory) .+ rev\. .+ -- .+ -- .+$`)
 	reHID      = regexp.MustCompile(`^HID: (\d+) , address: ([^ ]+) , port: (\d+) , .+ weight: (\d+) , status: (\w+) , max_connections: (\d+)`)
 	reServer   = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[INFO\] Creating new server in HG (\d+) : ([^:]+):(\d+) , .+ weight=(\d+), status=(\d+)`)
@@ -128,12 +128,30 @@ var (
 	reVersion  = regexp.MustCompile(`ProxySQL version ([0-9][^\s]+)`)
 	reLatest   = regexp.MustCompile(`Latest ProxySQL version available: ([^\s]+)`)
 	reUUID     = regexp.MustCompile(`Using UUID: ([a-f0-9-]+)`)
+
+	// ANSI SGR color codes (e.g. \x1b[36m ... \x1b[0m) — common when
+	// ProxySQL runs under a container/k8s sidecar that colorizes stdout.
+	reANSI = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+	// A leading container/Kubernetes sidecar capture timestamp, always
+	// RFC3339(Nano)-with-"T", e.g. "YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ ".
+	// ProxySQL's own timestamps always use a space separator, never "T",
+	// so this can never collide with a real ProxySQL-emitted line.
+	reOuterTS = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})\.?\d*Z?\s+`)
+
+	// After the outer timestamp is stripped, a reordered "[LEVEL]:" prefix
+	// (some sidecars relabel the level ahead of the original content).
+	reLevelColon = regexp.MustCompile(`^\[(\w+)\]:\s*(.*)$`)
+
+	// A timestamp at the very start of a string, in either ProxySQL's own
+	// "YYYY-MM-DD HH:MM:SS" form or the sidecar's "YYYY-MM-DDTHH:MM:SS" form.
+	reInnerTS  = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(.*)$`)
 	reConfig   = regexp.MustCompile(`Using config file (.+)$`)
 	reOS       = regexp.MustCompile(`Detected OS: (.+)$`)
 	reOpenSSL  = regexp.MustCompile(`Using OpenSSL version: (.+)$`)
 	reSHA1     = regexp.MustCompile(`ProxySQL SHA1 checksum: ([a-f0-9]+)`)
 	reDatadir  = regexp.MustCompile(`datadir \(([^)]+)\)`)
-	reLoadSave = regexp.MustCompile(`Received (LOAD|SAVE) (.+?) TO (RUNTIME|DISK) command`)
+	reLoadSave = regexp.MustCompile(`(?i)Received (LOAD|SAVE) (.+?) (TO|FROM) (RUNTIME|RUN|DISK|MEMORY|CONFIG) command`)
 	reChecksum = regexp.MustCompile(`Computed checksum for '(.+?)' was '(.+?)', with epoch '(\d+)'`)
 	reTableRow = regexp.MustCompile(`^\|(.+)\|$`)
 	reTableSep = regexp.MustCompile(`^\+[-+]+\+$`)
@@ -199,6 +217,65 @@ func tableEngine(title string) (engine, kind string) {
 		kind = "dump"
 	}
 	return
+}
+
+// normalizeLine strips ANSI color codes and, if the line carries a
+// container/Kubernetes sidecar timestamp prefix, rewrites it back into
+// ProxySQL's normal "TIMESTAMP [LEVEL] message" shape. Every other
+// parsing function in this file only needs to understand that one
+// shape — this is the single place that adapts anything else to it.
+//
+// Sidecar wrapping shows up in more than one shape in practice:
+//  1. outer-timestamp + already-normal line:
+//     YYYY-MM-DDTHH:MM:SS.nnnZ YYYY-MM-DD HH:MM:SS [INFO] message
+//     -> "YYYY-MM-DD HH:MM:SS [INFO] message"
+//  2. outer-timestamp + reordered "[LEVEL]:" + inner timestamp + message:
+//     YYYY-MM-DDTHH:MM:SS.nnnZ [INFO]:YYYY-MM-DD HH:MM:SS message
+//     YYYY-MM-DDTHH:MM:SS.nnnZ [INFO]:YYYY-MM-DDTHH:MM:SS - message
+//     -> "YYYY-MM-DD HH:MM:SS [INFO] message"
+//  3. outer-timestamp + "[LEVEL]:" with no inner timestamp at all —
+//     falls back to the outer timestamp:
+//     YYYY-MM-DDTHH:MM:SS.nnnZ [INFO]: message
+//     -> "YYYY-MM-DD HH:MM:SS [INFO] message"
+//
+// If none of these are recognized, the line is returned ANSI-stripped
+// but otherwise untouched, so unexpected formats degrade gracefully
+// (parsed as an untimed/"OTHER" entry) instead of being corrupted.
+func normalizeLine(raw string) string {
+	line := reANSI.ReplaceAllString(raw, "")
+
+	m := reOuterTS.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	outerTS := m[1] + " " + m[2]
+	rest := line[len(m[0]):]
+
+	// Shape 1: already normal once the outer wrapper is removed.
+	if reStandard.MatchString(rest) || reSource.MatchString(rest) {
+		return rest
+	}
+
+	// Shapes 2 & 3: reordered "[LEVEL]:" prefix.
+	if lm := reLevelColon.FindStringSubmatch(rest); lm != nil {
+		level, tail := lm[1], lm[2]
+		if im := reInnerTS.FindStringSubmatch(tail); im != nil {
+			ts := im[1] + " " + im[2]
+			msg := strings.TrimLeft(im[3], "- \t")
+			return fmt.Sprintf("%s [%s] %s", ts, level, msg)
+		}
+		msg := strings.TrimLeft(tail, "- \t")
+		return fmt.Sprintf("%s [%s] %s", outerTS, level, msg)
+	}
+
+	// No "[LEVEL]" marker at all — this is a continuation/detail line
+	// (an HID dump row, an ASCII table border/row, banner text, etc)
+	// that a per-line sidecar timestamped individually even though it
+	// never carried a timestamp in ProxySQL's native log format. Strip
+	// the outer wrapper and let it fall through to whichever downstream
+	// detector applies (reHID, isTableLine, reBanner, ...) — don't
+	// leave the timestamp attached, or none of those will ever match.
+	return rest
 }
 
 func statusLabel(code string) string {
@@ -317,7 +394,7 @@ func parseLog(path string) (*Analysis, error) {
 
 	var lines []string
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		lines = append(lines, normalizeLine(scanner.Text()))
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -521,15 +598,16 @@ func parseLog(path string) (*Analysis, error) {
 
 		// Config events
 		if m := reLoadSave.FindStringSubmatch(entry.Message); m != nil {
+			action := strings.ToUpper(m[1])
 			ce := ConfigEvent{
 				Timestamp: entry.Timestamp,
-				Action:    m[1],
-				Target:    m[2] + " TO " + m[3],
+				Action:    action,
+				Target:    strings.ToUpper(m[2]) + " " + strings.ToUpper(m[3]) + " " + strings.ToUpper(m[4]),
 				LineNum:   lineNum,
 			}
 			a.ConfigEvents = append(a.ConfigEvents, ce)
-			addTimeline(entry.Timestamp, "config_"+strings.ToLower(m[1]), "INFO",
-				fmt.Sprintf("%s %s", m[1], m[2]),
+			addTimeline(entry.Timestamp, "config_"+strings.ToLower(action), "INFO",
+				fmt.Sprintf("%s %s", action, strings.ToUpper(m[2])),
 				entry.Message, entry.Source, "", "", lineNum)
 		}
 		if m := reChecksum.FindStringSubmatch(entry.Message); m != nil {
@@ -1054,12 +1132,12 @@ table.data tr.hidden { display: none; }
 
   <div class="tabs">
     <button class="tab active" data-tab="overview">Overview</button>
-    <button class="tab" data-tab="timeline">Event Timeline<span class="cnt">{{len .Timeline}}</span></button>
-    <button class="tab" data-tab="config">Config Changes<span class="cnt">{{len .ConfigEvents}}</span></button>
-    <button class="tab" data-tab="nodes">Backend Node Events<span class="cnt">{{len .BackendNodes}}</span></button>
-    <button class="tab" data-tab="errors">Errors<span class="cnt">{{len .Errors}}</span></button>
-    <button class="tab" data-tab="warnings">Warnings<span class="cnt">{{len .Warnings}}</span></button>
-    <button class="tab" data-tab="dumps">Node Dumps<span class="cnt">{{len .Tables}}</span></button>
+    <button class="tab" data-tab="timeline">Event Timeline<span class="cnt" id="cnt-timeline">{{len .Timeline}}</span></button>
+    <button class="tab" data-tab="config">Config Changes<span class="cnt" id="cnt-config">{{len .ConfigEvents}}</span></button>
+    <button class="tab" data-tab="nodes">Backend Node Events<span class="cnt" id="cnt-nodes">{{len .BackendNodes}}</span></button>
+    <button class="tab" data-tab="errors">Errors<span class="cnt" id="cnt-errors">{{len .Errors}}</span></button>
+    <button class="tab" data-tab="warnings">Warnings<span class="cnt" id="cnt-warnings">{{len .Warnings}}</span></button>
+    <button class="tab" data-tab="dumps">Node Dumps<span class="cnt" id="cnt-dumps">{{len .Tables}}</span></button>
     <button class="tab" data-tab="logs">Full Log</button>
   </div>
 
@@ -1410,6 +1488,25 @@ function applyGlobalSearch() {
   } else {
     clearHighlights();
   }
+
+  updateTabCounts();
+}
+
+// Tab badges start out showing the log's total counts (rendered
+// server-side). Once any filter is active, they should reflect what's
+// actually visible in each tab right now — otherwise the counters look
+// static and misleading while the content underneath is filtered.
+function updateTabCounts() {
+  const setCnt = (id, count) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = count;
+  };
+  setCnt('cnt-timeline', document.querySelectorAll('#event-timeline .tl-item:not(.hidden)').length);
+  setCnt('cnt-config', document.querySelectorAll('#config .config-row:not(.hidden)').length);
+  setCnt('cnt-nodes', document.querySelectorAll('#nodes-table tbody tr:not(.hidden)').length);
+  setCnt('cnt-errors', document.querySelectorAll('#errors .alert-card:not(.hidden)').length);
+  setCnt('cnt-warnings', document.querySelectorAll('#warnings .alert-card:not(.hidden)').length);
+  setCnt('cnt-dumps', document.querySelectorAll('#dumps .dump-card:not(.hidden)').length);
 }
 
 function highlightMatches(q) {
