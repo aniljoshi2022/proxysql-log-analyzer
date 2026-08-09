@@ -137,24 +137,41 @@ var (
 	// RFC3339(Nano)-with-"T", e.g. "YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ ".
 	// ProxySQL's own timestamps always use a space separator, never "T",
 	// so this can never collide with a real ProxySQL-emitted line.
+	// Anchored at the start of the line: this only strips a *leading*
+	// wrapper, not one buried inside quoted/CSV content elsewhere.
 	reOuterTS = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})\.?\d*Z?\s+`)
 
-	// After the outer timestamp is stripped, a reordered "[LEVEL]:" prefix
-	// (some sidecars relabel the level ahead of the original content).
-	reLevelColon = regexp.MustCompile(`^\[(\w+)\]:\s*(.*)$`)
+	// ProxySQL's own timestamp pattern, found ANYWHERE in a line rather
+	// than anchored to the start. This is the one thing that's actually
+	// invariant across every collector/wrapper/export format we've seen
+	// (plain stdout, Kubernetes sidecars, CSV/Kibana exports, ANSI
+	// color-coded wrappers, ...): whatever noise a given tool wraps
+	// around a log line, ProxySQL itself always emits "YYYY-MM-DD
+	// HH:MM:SS" (or "YYYY-MM-DDTHH:MM:SS" once a wrapper has rewritten
+	// the separator). Searching for this pattern instead of matching
+	// specific wrapper shapes is what makes normalizeLine resilient to
+	// wrapper formats it has never seen before.
+	reTSAnywhere = regexp.MustCompile(`(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})`)
 
-	// A timestamp at the very start of a string, in either ProxySQL's own
-	// "YYYY-MM-DD HH:MM:SS" form or the sidecar's "YYYY-MM-DDTHH:MM:SS" form.
-	reInnerTS  = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(.*)$`)
-	reConfig   = regexp.MustCompile(`Using config file (.+)$`)
-	reOS       = regexp.MustCompile(`Detected OS: (.+)$`)
-	reOpenSSL  = regexp.MustCompile(`Using OpenSSL version: (.+)$`)
-	reSHA1     = regexp.MustCompile(`ProxySQL SHA1 checksum: ([a-f0-9]+)`)
-	reDatadir  = regexp.MustCompile(`datadir \(([^)]+)\)`)
-	reLoadSave = regexp.MustCompile(`(?i)Received (LOAD|SAVE) (.+?) (TO|FROM) (RUNTIME|RUN|DISK|MEMORY|CONFIG) command`)
-	reChecksum = regexp.MustCompile(`Computed checksum for '(.+?)' was '(.+?)', with epoch '(\d+)'`)
-	reTableRow = regexp.MustCompile(`^\|(.+)\|$`)
-	reTableSep = regexp.MustCompile(`^\+[-+]+\+$`)
+	// What immediately follows ProxySQL's own timestamp, in either of
+	// the two native shapes: with or without a "source.cpp:N:func():"
+	// prefix before "[LEVEL]".
+	reLevelAfter       = regexp.MustCompile(`^[\s:.-]*\[(\w+)\]\s*(.*)$`)
+	reSourceLevelAfter = regexp.MustCompile(`^[\s:.-]*([^\s:]+\.\w+:\d+:[\w:]+\(\)):\s*\[(\w+)\]\s*(.*)$`)
+
+	// A "[LEVEL]:" (or "[LEVEL] :") marker sitting immediately before
+	// where the timestamp starts — the reordered-wrapper shape, where a
+	// sidecar relabels the level ahead of the original timestamped line.
+	reLevelBefore = regexp.MustCompile(`\[(\w+)\]\s*:?\s*$`)
+	reConfig      = regexp.MustCompile(`Using config file (.+)$`)
+	reOS          = regexp.MustCompile(`Detected OS: (.+)$`)
+	reOpenSSL     = regexp.MustCompile(`Using OpenSSL version: (.+)$`)
+	reSHA1        = regexp.MustCompile(`ProxySQL SHA1 checksum: ([a-f0-9]+)`)
+	reDatadir     = regexp.MustCompile(`datadir \(([^)]+)\)`)
+	reLoadSave    = regexp.MustCompile(`(?i)Received (LOAD|SAVE) (.+?) (TO|FROM) (RUNTIME|RUN|DISK|MEMORY|CONFIG) command`)
+	reChecksum    = regexp.MustCompile(`Computed checksum for '(.+?)' was '(.+?)', with epoch '(\d+)'`)
+	reTableRow    = regexp.MustCompile(`^\|(.+)\|$`)
+	reTableSep    = regexp.MustCompile(`^\+[-+]+\+$`)
 )
 
 func categorize(level, msg, source string) string {
@@ -219,63 +236,85 @@ func tableEngine(title string) (engine, kind string) {
 	return
 }
 
-// normalizeLine strips ANSI color codes and, if the line carries a
-// container/Kubernetes sidecar timestamp prefix, rewrites it back into
-// ProxySQL's normal "TIMESTAMP [LEVEL] message" shape. Every other
-// parsing function in this file only needs to understand that one
-// shape — this is the single place that adapts anything else to it.
+// stripStrayTrailingQuote removes a single trailing '"' left over when a
+// line came from a CSV/quoted export field (e.g. a Kibana CSV export
+// wraps the whole message in quotes). Only trims when the quote count
+// is odd — i.e. clearly unbalanced/an artifact — so a genuine message
+// that legitimately ends with a properly paired quoted phrase is left
+// alone.
+func stripStrayTrailingQuote(msg string) string {
+	if strings.HasSuffix(msg, `"`) && strings.Count(msg, `"`)%2 == 1 {
+		return strings.TrimSuffix(msg, `"`)
+	}
+	return msg
+}
+
+// normalizeLine strips ANSI color codes and rewrites whatever wrapper a
+// log collector has put around a line back into ProxySQL's normal
+// "TIMESTAMP [LEVEL] message" shape. Every other parsing function in
+// this file only needs to understand that one shape — this is the
+// single place that adapts anything else to it.
 //
-// Sidecar wrapping shows up in more than one shape in practice:
-//  1. outer-timestamp + already-normal line:
-//     YYYY-MM-DDTHH:MM:SS.nnnZ YYYY-MM-DD HH:MM:SS [INFO] message
-//     -> "YYYY-MM-DD HH:MM:SS [INFO] message"
-//  2. outer-timestamp + reordered "[LEVEL]:" + inner timestamp + message:
-//     YYYY-MM-DDTHH:MM:SS.nnnZ [INFO]:YYYY-MM-DD HH:MM:SS message
-//     YYYY-MM-DDTHH:MM:SS.nnnZ [INFO]:YYYY-MM-DDTHH:MM:SS - message
-//     -> "YYYY-MM-DD HH:MM:SS [INFO] message"
-//  3. outer-timestamp + "[LEVEL]:" with no inner timestamp at all —
-//     falls back to the outer timestamp:
-//     YYYY-MM-DDTHH:MM:SS.nnnZ [INFO]: message
-//     -> "YYYY-MM-DD HH:MM:SS [INFO] message"
+// Rather than matching specific known wrapper shapes (which breaks the
+// moment a new collector, export tool, or timestamp format shows up),
+// this works off the one thing that's actually invariant: ProxySQL
+// itself always emits its own timestamp as "YYYY-MM-DD HH:MM:SS" (or
+// "...T..." once some wrapper has rewritten the separator). The
+// algorithm is:
+//  1. If the line starts with a bare RFC3339-ish sidecar timestamp
+//     (Docker/Kubernetes style), strip it.
+//  2. Search whatever remains for ProxySQL's own timestamp pattern —
+//     wherever it appears, regardless of what precedes it: CSV/quoted
+//     export fields, human-readable collector dates (e.g. "Jul 10,
+//     2026 @ ..."), arbitrary prefixes, anything. None of that needs
+//     to be recognized explicitly; it's simply skipped over.
+//  3. Once the timestamp is located, look at what's immediately before
+//     and after it for a "[LEVEL]" marker, in either supported order
+//     (level-after — the native shape, with or without a source
+//     location — or level-before-with-colon — a reordered wrapper).
 //
-// If none of these are recognized, the line is returned ANSI-stripped
-// but otherwise untouched, so unexpected formats degrade gracefully
-// (parsed as an untimed/"OTHER" entry) instead of being corrupted.
+// If no ProxySQL timestamp can be found anywhere in the line, it's
+// returned ANSI-stripped but otherwise untouched, so unrecognized
+// content degrades gracefully (parsed as an untimed/"OTHER" entry)
+// instead of being corrupted.
 func normalizeLine(raw string) string {
 	line := reANSI.ReplaceAllString(raw, "")
 
-	m := reOuterTS.FindStringSubmatch(line)
-	if m == nil {
+	if m := reOuterTS.FindStringSubmatch(line); m != nil {
+		line = line[len(m[0]):]
+	}
+
+	loc := reTSAnywhere.FindStringSubmatchIndex(line)
+	if loc == nil {
 		return line
 	}
-	outerTS := m[1] + " " + m[2]
-	rest := line[len(m[0]):]
+	ts := line[loc[2]:loc[3]] + " " + line[loc[4]:loc[5]]
+	before := line[:loc[0]]
+	after := line[loc[1]:]
 
-	// Shape 1: already normal once the outer wrapper is removed.
-	if reStandard.MatchString(rest) || reSource.MatchString(rest) {
-		return rest
+	// Native shape (with optional source location) — level comes after
+	// the timestamp. Try the source-location variant first since it's
+	// more specific.
+	if m := reSourceLevelAfter.FindStringSubmatch(after); m != nil {
+		return fmt.Sprintf("%s %s: [%s] %s", ts, m[1], m[2], stripStrayTrailingQuote(m[3]))
+	}
+	if m := reLevelAfter.FindStringSubmatch(after); m != nil {
+		return fmt.Sprintf("%s [%s] %s", ts, m[1], stripStrayTrailingQuote(m[2]))
 	}
 
-	// Shapes 2 & 3: reordered "[LEVEL]:" prefix.
-	if lm := reLevelColon.FindStringSubmatch(rest); lm != nil {
-		level, tail := lm[1], lm[2]
-		if im := reInnerTS.FindStringSubmatch(tail); im != nil {
-			ts := im[1] + " " + im[2]
-			msg := strings.TrimLeft(im[3], "- \t")
-			return fmt.Sprintf("%s [%s] %s", ts, level, msg)
-		}
-		msg := strings.TrimLeft(tail, "- \t")
-		return fmt.Sprintf("%s [%s] %s", outerTS, level, msg)
+	// Reordered-wrapper shape — level sits just before the timestamp,
+	// joined by a colon (e.g. sidecar-relabeled "[INFO]:<timestamp> msg").
+	if m := reLevelBefore.FindStringSubmatch(before); m != nil {
+		msg := strings.TrimLeft(after, " \t:.-")
+		return fmt.Sprintf("%s [%s] %s", ts, m[1], stripStrayTrailingQuote(msg))
 	}
 
-	// No "[LEVEL]" marker at all — this is a continuation/detail line
-	// (an HID dump row, an ASCII table border/row, banner text, etc)
-	// that a per-line sidecar timestamped individually even though it
-	// never carried a timestamp in ProxySQL's native log format. Strip
-	// the outer wrapper and let it fall through to whichever downstream
-	// detector applies (reHID, isTableLine, reBanner, ...) — don't
-	// leave the timestamp attached, or none of those will ever match.
-	return rest
+	// Timestamp found but no recognizable level marker nearby — this is
+	// a continuation/detail line (HID dump row, ASCII table border/row,
+	// banner text with an embedded date, ...). Keep the timestamp region
+	// intact (don't inject a level) and let it fall through to whichever
+	// downstream detector applies.
+	return before + ts + after
 }
 
 func statusLabel(code string) string {
